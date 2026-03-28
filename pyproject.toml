@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "reviews-parsers"
+version = "1.0.0"
+description = "Парсеры отзывов с Яндекс Карт и Google Maps"
+authors = ["hertzxq"]
+readme = "README.md"
+packages = [{include = "yandex_reviews"}, {include = "google_reviews"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+playwright = "^1.49"
+beautifulsoup4 = "^4.12"
+lxml = "^5.3"
+pydantic = "^2.10"
+asyncpg = "^0.30"
+
+[tool.poetry.scripts]
+yandex-reviews = "yandex_reviews.cli:main"
+google-reviews = "google_reviews.cli:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
