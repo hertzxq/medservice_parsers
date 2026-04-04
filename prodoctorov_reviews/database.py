@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS organizations (
     overall_rating REAL,
     total_reviews_on_page INTEGER,
     source_url TEXT NOT NULL,
-    source VARCHAR(50) NOT NULL DEFAULT 'yandex',
+    source VARCHAR(50) NOT NULL DEFAULT 'prodoctorov',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (source_url, source)
@@ -70,7 +70,7 @@ class Database:
             row = await conn.fetchrow(
                 """
                 INSERT INTO organizations (name, address, overall_rating, total_reviews_on_page, source_url, source)
-                VALUES ($1, $2, $3, $4, $5, 'yandex')
+                VALUES ($1, $2, $3, $4, $5, 'prodoctorov')
                 ON CONFLICT (source_url, source) DO UPDATE SET
                     name = EXCLUDED.name,
                     address = EXCLUDED.address,
@@ -93,6 +93,18 @@ class Database:
         async with self._pool.acquire() as conn:
             for review in reviews:
                 try:
+                    # Рейтинг: округляем float до int для совместимости со схемой
+                    raw_rating = review.get("rating", 1)
+                    db_rating = max(1, min(5, round(float(raw_rating))))
+
+                    # Текст: объединяем основной текст + pros + cons
+                    text_parts = [review.get("text", "")]
+                    if review.get("pros"):
+                        text_parts.append(f"Понравилось: {review['pros']}")
+                    if review.get("cons"):
+                        text_parts.append(f"Не понравилось: {review['cons']}")
+                    full_text = "\n".join(p for p in text_parts if p)
+
                     await conn.execute(
                         """
                         INSERT INTO reviews (organization_id, author, rating, date, text, response)
@@ -101,9 +113,9 @@ class Database:
                         """,
                         organization_id,
                         review.get("author", ""),
-                        review.get("rating", 1),
+                        db_rating,
                         review.get("date", ""),
-                        review.get("text", ""),
+                        full_text,
                         review.get("response"),
                     )
                     inserted += 1

@@ -38,11 +38,18 @@ class GoogleReviewsParser:
         logger.info("Запуск парсинга: %s", url)
 
         async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=self.headless)
+            browser = await pw.chromium.launch(
+                headless=self.headless,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
             context = await browser.new_context(
                 viewport={"width": 1920, "height": 1080},
                 locale="ru-RU",
                 user_agent=USER_AGENT,
+            )
+            # Убираем navigator.webdriver для обхода бот-детекции
+            await context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
             )
             page = await context.new_page()
             try:
@@ -62,29 +69,36 @@ class GoogleReviewsParser:
 
         await page.goto(url, wait_until="load", timeout=timeout_ms)
 
-        await self._wait_for_place_loaded(page)
+        # Обработка Google consent-диалога
+        await self._handle_consent(page)
 
+        # Ждём загрузки карточки заведения
+        await self._wait_for_place_loaded(page)
+        await page.wait_for_timeout(2000)
+
+        # Извлекаем бизнес-инфо
         html_before = await page.content()
         soup_before = BeautifulSoup(html_before, "lxml")
         business_info = self._extract_business_info(soup_before)
 
-        await self._open_reviews_tab(page)
+        # Переход к отзывам — пробуем несколько стратегий
+        await self._navigate_to_reviews(page)
+
         await page.wait_for_timeout(self.initial_load_delay_ms)
 
-        try:
-            await page.wait_for_selector(
-                SELECTORS["scroll_container"], timeout=timeout_ms
-            )
-        except Exception:
-            logger.warning("Контейнер скролла не найден, продолжаем")
+        # Ждём появления контейнера с отзывами
+        await self._wait_for_reviews(page)
 
-        await self._scroll_to_bottom(page)
+        # Скроллим до конца списка отзывов
+        await self._scroll_reviews(page)
+
+        # Раскрываем длинные отзывы
         await self._expand_elements(page, SELECTORS["review_expand_button"])
         await page.wait_for_timeout(self.post_expand_delay_ms)
 
+        # Парсим HTML
         html = await page.content()
         soup = BeautifulSoup(html, "lxml")
-
         reviews = self._extract_reviews(soup)
 
         return ParseResult(
@@ -94,49 +108,180 @@ class GoogleReviewsParser:
             source_url=url,
         )
 
+    async def _handle_consent(self, page: Page) -> None:
+        """Обработка Google consent-диалога."""
+        try:
+            await page.wait_for_timeout(1000)
+            for sel in [
+                "button[aria-label*='Accept']",
+                "button[aria-label*='Принять']",
+                "form[action*='consent'] button",
+            ]:
+                btn = await page.query_selector(sel)
+                if btn:
+                    await btn.click()
+                    logger.info("Consent-диалог принят")
+                    await page.wait_for_timeout(2000)
+                    return
+        except Exception:
+            pass
+
     async def _wait_for_place_loaded(self, page: Page) -> None:
+        """Ожидание загрузки карточки заведения (SPA)."""
         try:
             await page.wait_for_function(
-                """() => {
-                    const h1 = document.querySelector('h1.DUwDvf');
-                    return h1 && h1.textContent.trim().length > 0;
-                }""",
+                "() => { const h1 = document.querySelector('h1.DUwDvf'); "
+                "return h1 && h1.textContent.trim().length > 0; }",
                 timeout=self.page_load_timeout_sec * 1000,
             )
             logger.debug("Карточка заведения загружена")
         except Exception:
             logger.warning("Карточка заведения не загрузилась, продолжаем")
 
-    async def _open_reviews_tab(self, page: Page) -> None:
-        try:
-            tabs = await page.query_selector_all(SELECTORS["reviews_tab"])
-            for tab in tabs:
-                label = await tab.get_attribute("aria-label") or ""
-                text = (await tab.text_content() or "").strip().lower()
-                if any(kw in label.lower() for kw in ["отзыв", "review"]) or \
-                   any(kw in text for kw in ["отзыв", "review"]):
-                    await tab.click()
-                    logger.debug("Вкладка 'Отзывы' открыта")
-                    return
-            logger.debug("Вкладка 'Отзывы' не найдена среди %d табов", len(tabs))
-        except Exception as exc:
-            logger.warning("Не удалось открыть вкладку Отзывы: %s", exc)
+    async def _navigate_to_reviews(self, page: Page) -> None:
+        """Переход к отзывам. Google Maps может не рендерить role=tab в Playwright.
+        
+        Стратегии:
+        1. Клик по вкладке 'Отзывы' (role=tab)
+        2. Прокрутить сайдбар вниз + клик 'Ещё отзывы'
+        3. Клик по рейтингу / количеству отзывов
+        """
+        # Стратегия 1: Клик по role=tab 'Отзывы'
+        tab_clicked = await page.evaluate(
+            """() => {
+                const tabs = document.querySelectorAll("button[role='tab']");
+                for (const tab of tabs) {
+                    const text = tab.textContent.trim().toLowerCase();
+                    const aria = (tab.getAttribute('aria-label') || '').toLowerCase();
+                    if (text.includes('отзыв') || text.includes('review') || 
+                        aria.includes('отзыв') || aria.includes('review')) {
+                        tab.click();
+                        return 'tab';
+                    }
+                }
+                return null;
+            }"""
+        )
+        if tab_clicked:
+            logger.info("Переход к отзывам: клик по вкладке (role=tab)")
+            await page.wait_for_timeout(3000)
+            return
 
-    async def _scroll_to_bottom(self, page: Page) -> None:
+        logger.debug("Вкладки role=tab не найдены, прокручиваем сайдбар...")
+
+        # Стратегия 2: Прокрутить сайдбар вниз и найти кнопку 'Ещё отзывы'
+        # Google Maps без табов показывает отзывы внизу обзорной страницы
+        for _ in range(10):
+            await page.evaluate(
+                """() => {
+                    const sidebar = document.querySelector('div.m6QErb.DxyBCb');
+                    if (sidebar) {
+                        sidebar.scrollBy({top: 1000, behavior: 'smooth'});
+                        return true;
+                    }
+                    // Фоллбэк — скроллим все m6QErb
+                    const containers = document.querySelectorAll('div.m6QErb');
+                    for (const c of containers) {
+                        c.scrollBy({top: 1000, behavior: 'smooth'});
+                    }
+                    return false;
+                }"""
+            )
+            await page.wait_for_timeout(500)
+
+        # Ищем и кликаем 'Ещё отзывы'
+        more_clicked = await page.evaluate(
+            """() => {
+                const btns = document.querySelectorAll('button');
+                for (const btn of btns) {
+                    const text = btn.textContent.trim().toLowerCase();
+                    const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+                    if (text.includes('ещё отзыв') || text.includes('more review') ||
+                        aria.includes('ещё отзыв') || aria.includes('more review')) {
+                        btn.click();
+                        return 'more_reviews';
+                    }
+                }
+                return null;
+            }"""
+        )
+        if more_clicked:
+            logger.info("Переход к отзывам: клик по 'Ещё отзывы'")
+            await page.wait_for_timeout(3000)
+            return
+
+        # Стратегия 3: Клик по рейтингу
+        rating_clicked = await page.evaluate(
+            """() => {
+                // Клик по области рейтинга (кнопка со звёздами)
+                const ratingBtn = document.querySelector('button.fontDisplayLarge');
+                if (ratingBtn) {
+                    ratingBtn.click();
+                    return 'rating';
+                }
+
+                // Клик по числу отзывов
+                const spans = document.querySelectorAll('span');
+                for (const span of spans) {
+                    const text = span.textContent.trim();
+                    if (/^\(\d+\)$/.test(text) || /^\d+\s*(отзыв|review)/i.test(text)) {
+                        span.click();
+                        return 'review_count';
+                    }
+                }
+                return null;
+            }"""
+        )
+        if rating_clicked:
+            logger.info("Переход к отзывам: клик по рейтингу/числу отзывов")
+            await page.wait_for_timeout(3000)
+            return
+
+        logger.warning("Не удалось перейти к отзывам ни одним способом")
+
+    async def _wait_for_reviews(self, page: Page) -> None:
+        """Ожидание появления контейнера отзывов."""
+        try:
+            await page.wait_for_selector(
+                SELECTORS["reviews_container"],
+                timeout=10000,
+            )
+            count = await page.evaluate(
+                f"() => document.querySelectorAll('{SELECTORS['reviews_container']}').length"
+            )
+            logger.debug("Контейнеры отзывов найдены: %d", count)
+        except Exception:
+            logger.warning("Контейнеры отзывов не появились (timeout 10s)")
+
+    async def _scroll_reviews(self, page: Page) -> None:
+        """Прокрутка списка отзывов до конца."""
         last_scroll = -1
         stable_count = 0
-        scroll_selector = SELECTORS["scroll_container"]
         pause_ms = int(self.scroll_pause_sec * 1000)
 
-        while stable_count < self.stable_scroll_threshold:
-            current_scroll, _ = await page.evaluate(
-                f"""() => {{
-                    const el = document.querySelector('{scroll_selector}');
-                    if (!el) return [0, 0];
+        reviews_sel = SELECTORS["reviews_container"]
+        scroll_sel = SELECTORS["scroll_container"]
+
+        scroll_js = f"""() => {{
+            // Ищем контейнер m6QErb, который содержит отзывы
+            const containers = document.querySelectorAll('{scroll_sel}');
+            for (const el of containers) {{
+                if (el.querySelectorAll('{reviews_sel}').length > 0) {{
                     el.scrollBy({{ top: {self.scroll_step_px}, behavior: 'smooth' }});
                     return [el.scrollTop, el.scrollHeight];
-                }}"""
-            )
+                }}
+            }}
+            // Фоллбэк: scrollable=true
+            const scrollable = document.querySelector("div[scrollable='true']");
+            if (scrollable) {{
+                scrollable.scrollBy({{ top: {self.scroll_step_px}, behavior: 'smooth' }});
+                return [scrollable.scrollTop, scrollable.scrollHeight];
+            }}
+            return [0, 0];
+        }}"""
+
+        while stable_count < self.stable_scroll_threshold:
+            current_scroll, _ = await page.evaluate(scroll_js)
 
             if current_scroll == last_scroll:
                 stable_count += 1
@@ -149,6 +294,7 @@ class GoogleReviewsParser:
         logger.debug("Скроллинг завершён, финальная позиция: %d", last_scroll)
 
     async def _expand_elements(self, page: Page, selector: str) -> None:
+        """Раскрытие свёрнутых отзывов (кнопка 'Ещё')."""
         try:
             buttons = await page.query_selector_all(selector)
             for btn in buttons:
@@ -163,8 +309,8 @@ class GoogleReviewsParser:
             logger.warning("Ошибка раскрытия элементов [%s]: %s", selector, exc)
 
     def _extract_business_info(self, soup: BeautifulSoup) -> BusinessInfo:
+        """Извлечение информации об организации."""
         name = self._text(soup, SELECTORS["business_name"])
-
         address = self._text(soup, SELECTORS["business_address"])
 
         rating = None
@@ -194,6 +340,7 @@ class GoogleReviewsParser:
         )
 
     def _extract_reviews(self, soup: BeautifulSoup) -> list[Review]:
+        """Извлечение списка отзывов."""
         elements = soup.select(SELECTORS["reviews_container"])
         reviews = []
 
@@ -206,6 +353,7 @@ class GoogleReviewsParser:
         return reviews
 
     def _parse_single_review(self, el) -> Review | None:
+        """Парсинг одного отзыва."""
         try:
             author = self._text(el, SELECTORS["review_author_name"])
             text = self._text(el, SELECTORS["review_text"])
@@ -229,6 +377,7 @@ class GoogleReviewsParser:
             return None
 
     def _extract_rating(self, el) -> int:
+        """Извлечение рейтинга из aria-label звёзд."""
         stars_container = el.select_one(SELECTORS["review_stars_container"])
         if not stars_container:
             return 1

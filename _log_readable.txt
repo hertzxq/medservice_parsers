@@ -1,0 +1,38 @@
+.venv\Scripts\python.exe : 
+Traceback (most recent call 
+last):
+строка:1 знак:1
++ .venv\Scripts\python.exe -m 
+twogis_reviews --url 
+"https://2gis.ru/spb ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~
+    + CategoryInfo          : 
+    NotSpecified: (Traceback  
+   (most recent call last):   
+ :String) [], RemoteExcept    
+ion
+    + FullyQualifiedErrorId : 
+    NativeCommandError
+ 
+  File "<frozen runpy>", line 
+189, in _run_module_as_main
+  File "<frozen runpy>", line 
+148, in _get_module_details
+  File "<frozen runpy>", line 
+112, in _get_module_details
+  File "C:\Users\bomsh\Documen
+ts\GitHub\medservice_parsers\t
+wogis_reviews\__init__.py", 
+line 1, in <module>
+    from .parser import 
+TwoGisParser
+  File "C:\Users\bomsh\Documen
+ts\GitHub\medservice_parsers\t
+wogis_reviews\parser.py", 
+line 431
+    api_url, 
+headers=request_headers,
+IndentationError: unexpected 
+indent

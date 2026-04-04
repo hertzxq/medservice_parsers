@@ -1,0 +1,10 @@
+403: '            if api_url_template:\n'
+404: '                # Строим URL из перехваченного шаблона, заменяя offset и limit\n'
+405: "                api_url = re.sub(r'offset=\\d+', f'offset={offset}', api_url_template)\n"
+406: "                if 'limit=' in api_url:\n"
+407: "                    api_url = re.sub(r'limit=\\d+', f'limit={limit}', api_url)\n"
+408: '                else:\n'
+409: "                    sep = '&' if '?' in api_url else '?'\n"
+410: "                    api_url += f'{sep}limit={limit}'\n"
+411: '            else:\n'
+412: '                api_url = (\n'

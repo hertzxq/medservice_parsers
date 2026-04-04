@@ -14,9 +14,11 @@ CREATE TABLE IF NOT EXISTS organizations (
     address VARCHAR(500) NOT NULL DEFAULT '',
     overall_rating REAL,
     total_reviews_on_page INTEGER,
-    source_url TEXT NOT NULL UNIQUE,
+    source_url TEXT NOT NULL,
+    source VARCHAR(50) NOT NULL DEFAULT 'google',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (source_url, source)
 );
 
 CREATE TABLE IF NOT EXISTS reviews (
@@ -67,9 +69,9 @@ class Database:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO organizations (name, address, overall_rating, total_reviews_on_page, source_url)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (source_url) DO UPDATE SET
+                INSERT INTO organizations (name, address, overall_rating, total_reviews_on_page, source_url, source)
+                VALUES ($1, $2, $3, $4, $5, 'google')
+                ON CONFLICT (source_url, source) DO UPDATE SET
                     name = EXCLUDED.name,
                     address = EXCLUDED.address,
                     overall_rating = EXCLUDED.overall_rating,

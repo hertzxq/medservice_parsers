@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS organizations (
     overall_rating REAL,
     total_reviews_on_page INTEGER,
     source_url TEXT NOT NULL,
-    source VARCHAR(50) NOT NULL DEFAULT 'yandex',
+    source VARCHAR(50) NOT NULL DEFAULT '2gis',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (source_url, source)
@@ -70,7 +70,7 @@ class Database:
             row = await conn.fetchrow(
                 """
                 INSERT INTO organizations (name, address, overall_rating, total_reviews_on_page, source_url, source)
-                VALUES ($1, $2, $3, $4, $5, 'yandex')
+                VALUES ($1, $2, $3, $4, $5, '2gis')
                 ON CONFLICT (source_url, source) DO UPDATE SET
                     name = EXCLUDED.name,
                     address = EXCLUDED.address,

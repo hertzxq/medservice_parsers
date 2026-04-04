@@ -1,4 +1,4 @@
-PLACE_URL_TEMPLATE = "https://www.google.com/maps/search/?api=1&query=place_id:{place_id}&query_place_id={place_id}"
+PLACE_URL_TEMPLATE = "https://www.google.com/maps/place/?q=place_id:{place_id}"
 
 SCROLL_PAUSE_SEC = 0.5
 SCROLL_STEP_PX = 3000
