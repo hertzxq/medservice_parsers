@@ -18,6 +18,9 @@ from .config import (
     MAX_API_RETRIES,
     API_RETRY_DELAY_MS,
     API_WAIT_TIMEOUT_SEC,
+    COMMENT_RETRY_COUNT,
+    COMMENT_RETRY_DELAY_MS,
+    MAX_REVIEWS,
     DEFAULT_API_KEY,
     SELECTORS,
     USER_AGENT,
@@ -48,6 +51,9 @@ class TwoGisParser:
         self.max_api_retries = kwargs.get("max_api_retries", MAX_API_RETRIES)
         self.api_retry_delay_ms = kwargs.get("api_retry_delay_ms", API_RETRY_DELAY_MS)
         self.api_wait_timeout_sec = kwargs.get("api_wait_timeout_sec", API_WAIT_TIMEOUT_SEC)
+        self.comment_retry_count = kwargs.get("comment_retry_count", COMMENT_RETRY_COUNT)
+        self.comment_retry_delay_ms = kwargs.get("comment_retry_delay_ms", COMMENT_RETRY_DELAY_MS)
+        self.max_reviews = kwargs.get("max_reviews", MAX_REVIEWS)
 
     async def parse_by_url(self, url: str) -> ParseResult:
         """Парсинг по прямой ссылке на страницу организации или вкладку отзывов."""
@@ -95,6 +101,7 @@ class TwoGisParser:
         api_key_holder: list[str] = []  # для извлечения API-ключа из запросов
         api_url_template_holder: list[str] = []  # полный URL первого запроса (для пагинации)
         api_request_headers: dict[str, str] = {}  # заголовки первого API-запроса
+        intercept_enabled = [True]  # флаг для отключения интерцептора
 
         async def _intercept_response(response):
             try:
@@ -107,6 +114,8 @@ class TwoGisParser:
 
                 # Обрабатываем только API отзывов 2GIS
                 if "public-api.reviews.2gis.com" not in resp_url:
+                    return
+                if not intercept_enabled[0]:
                     return
 
                 # Извлекаем API-ключ из URL запроса
@@ -174,7 +183,32 @@ class TwoGisParser:
 
         page.on("request", _intercept_request)
 
-        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        resp = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+
+        # Проверяем, что страница загрузилась корректно (не 404)
+        if resp and resp.status == 404:
+            logger.warning("Страница не найдена (404): %s", url)
+            return ParseResult(
+                business_info=BusinessInfo(),
+                reviews=[],
+                total_parsed=0,
+                source_url=url,
+            )
+
+        # Проверяем наличие индикатора «организация не найдена» в DOM
+        not_found = await page.evaluate("""() => {
+            const text = document.body?.innerText || '';
+            return /не найден|не существует|page not found/i.test(text)
+                && text.length < 2000;
+        }""")
+        if not_found:
+            logger.warning("Организация не найдена на странице: %s", url)
+            return ParseResult(
+                business_info=BusinessInfo(),
+                reviews=[],
+                total_parsed=0,
+                source_url=url,
+            )
 
         # Закрываем модальные окна (cookie-баннер, уведомление о сортировке и т.п.)
         await self._dismiss_modals(page)
@@ -191,16 +225,19 @@ class TwoGisParser:
                 self.api_wait_timeout_sec,
             )
 
-        # Прокручиваем для подгрузки всех отзывов
-        await self._scroll_to_bottom(page)
-
-        # Раскрываем обрезанные тексты
-        await self._expand_reviews(page)
-        await page.wait_for_timeout(self.post_expand_delay_ms)
+        # Прокручиваем для подгрузки отзывов только если API не перехвачен
+        # При активном API-режиме все отзывы загружаются через пагинацию
+        if not api_reviews:
+            await self._scroll_to_bottom(page)
+            # Раскрываем обрезанные тексты (нужно только для DOM-фоллбэка)
+            await self._expand_reviews(page)
+            await page.wait_for_timeout(self.post_expand_delay_ms)
 
         # Если API перехватил первую страницу, дозагружаем все остальные
         if api_reviews:
             api_key = api_key_holder[0] if api_key_holder else DEFAULT_API_KEY
+            # Отключаем интерцептор, чтобы fetch-запросы не дублировали отзывы
+            intercept_enabled[0] = False
             await self._load_remaining_reviews(
                 page, url, api_reviews, api_meta, api_comments, api_key,
                 extra_headers=api_request_headers,
@@ -356,11 +393,10 @@ class TwoGisParser:
         api_key: str,
         extra_headers: dict[str, str] | None = None,
     ) -> None:
-        """Дозагружает оставшиеся отзывы через Playwright APIRequestContext.
+        """Загружает ВСЕ отзывы филиала через API с sort_by=date_created и rated=true.
 
-        2GIS API использует cursor-пагинацию через next_link (offset_date),
-        а НЕ числовой offset. sort_by=date_created возвращает все отзывы,
-        sort_by=trust — только избранные.
+        2GIS по умолчанию отдаёт отзывы с rated=false (3 шт) и sort_by=trust.
+        Для получения всех 1000+ отзывов нужно rated=true и sort_by=date_created.
         """
         m = re.search(r"/firm/(\d+)", url)
         if not m:
@@ -368,13 +404,7 @@ class TwoGisParser:
             return
         firm_id = m.group(1)
 
-        loaded = len(api_reviews)
         limit = 50
-
-        logger.info(
-            "Дозагрузка отзывов: %d уже перехвачено, запрашиваем через API sort_by=date_created",
-            loaded,
-        )
 
         # Заголовки для запросов — берём из перехваченных, дополняем обязательные
         request_headers = {
@@ -387,16 +417,23 @@ class TwoGisParser:
                 if k.lower() not in ("host", "content-length", "content-type"):
                     request_headers[k] = v
 
-        # Базовый URL: всегда sort_by=date_created для получения всех отзывов
+        # Базовый URL: rated=true + sort_by=date_created для получения ВСЕХ отзывов филиала
         base_api_url = (
             f"https://public-api.reviews.2gis.com/3.0/branches/{firm_id}/reviews"
             f"?limit={limit}&sort_by=date_created&key={api_key}&locale=ru_RU"
             f"&fields=meta.providers,meta.branch_rating,meta.branch_reviews_count"
             f",meta.total_count,reviews.hiding_reason"
-            f"&without_my_first_review=false&rated=false&is_advertiser=false"
+            f"&without_my_first_review=false&rated=true&is_advertiser=false"
         )
 
-        # Cursor-пагинация: используем next_link из ответа
+        # Очищаем перехваченные trust-отзывы — будем загружать всё заново
+        trust_count = len(api_reviews)
+        api_reviews.clear()
+        logger.info(
+            "Очищено %d trust-отзывов, загружаем все через sort_by=date_created",
+            trust_count,
+        )
+
         next_url: str | None = base_api_url
         total_available: int | None = None
         page_num = 0
@@ -455,13 +492,11 @@ class TwoGisParser:
                 logger.warning("API вернул пустой ответ на странице %d, прерываем", page_num)
                 break
 
-            # Извлекаем total_count из meta (реальное число доступных отзывов)
             meta = data.get("meta", {})
             if total_available is None and isinstance(meta, dict):
                 total_available = meta.get("total_count") or meta.get("branch_reviews_count", 0)
-                # Обновляем api_meta для корректного подсчёта
                 api_meta.update(meta)
-                logger.info("Всего отзывов через API: %d", total_available)
+                logger.info("Всего отзывов через API (date_created): %d", total_available)
 
             new_reviews = data.get("reviews", [])
             if not new_reviews:
@@ -474,6 +509,11 @@ class TwoGisParser:
                 page_num, len(new_reviews), len(api_reviews),
                 total_available or "?",
             )
+
+            # Проверяем лимит отзывов
+            if self.max_reviews > 0 and len(api_reviews) >= self.max_reviews:
+                logger.info("Достигнут лимит отзывов (%d), прерываем загрузку", self.max_reviews)
+                break
 
             # Cursor-пагинация: next_link из meta
             next_link = meta.get("next_link") if isinstance(meta, dict) else None
@@ -542,25 +582,45 @@ class TwoGisParser:
                 f"https://public-api.reviews.2gis.com/3.0/reviews/{review_id}/comments"
                 f"?key={api_key}&locale=ru_RU"
             )
-            try:
-                resp = await page.context.request.get(
-                    comments_url, headers=request_headers,
-                )
-                if resp.ok:
-                    data = await resp.json()
-                    if isinstance(data, dict) and "comments" in data:
-                        api_comments[review_id] = data["comments"]
-                        logger.debug(
-                            "Загружено %d комментариев для отзыва %s",
-                            len(data["comments"]), review_id,
-                        )
-                else:
-                    logger.debug(
-                        "Ошибка загрузки комментариев для %s: HTTP %d", review_id, resp.status,
+            loaded = False
+            for attempt in range(1, self.comment_retry_count + 1):
+                try:
+                    resp = await page.context.request.get(
+                        comments_url, headers=request_headers,
                     )
-                await resp.dispose()
-            except Exception as exc:
-                logger.warning("Ошибка загрузки комментариев для %s: %s", review_id, exc)
+                    if resp.ok:
+                        data = await resp.json()
+                        if isinstance(data, dict) and "comments" in data:
+                            api_comments[review_id] = data["comments"]
+                            logger.debug(
+                                "Загружено %d комментариев для отзыва %s",
+                                len(data["comments"]), review_id,
+                            )
+                        await resp.dispose()
+                        loaded = True
+                        break
+                    elif resp.status == 429:
+                        delay = self.comment_retry_delay_ms * attempt
+                        logger.warning(
+                            "Rate-limit (429) при загрузке комментариев %s, попытка %d/%d, ждём %d мс",
+                            review_id, attempt, self.comment_retry_count, delay,
+                        )
+                        await resp.dispose()
+                        await page.wait_for_timeout(delay)
+                        continue
+                    else:
+                        logger.debug(
+                            "Ошибка загрузки комментариев для %s: HTTP %d", review_id, resp.status,
+                        )
+                        await resp.dispose()
+                        break  # Не retry для не-429 ошибок
+                except Exception as exc:
+                    logger.warning(
+                        "Ошибка загрузки комментариев для %s (попытка %d/%d): %s",
+                        review_id, attempt, self.comment_retry_count, exc,
+                    )
+                    if attempt < self.comment_retry_count:
+                        await page.wait_for_timeout(self.comment_retry_delay_ms)
 
             await page.wait_for_timeout(200)
 

@@ -1,10 +1,10 @@
 [tool.poetry]
 name = "reviews-parsers"
 version = "1.0.0"
-description = "Парсеры отзывов с Яндекс Карт, Google Maps, 2GIS и ПроДокторов"
+description = "Парсеры отзывов с Яндекс Карт, Google Maps, 2GIS, ПроДокторов и НаПоправку"
 authors = ["hertzxq"]
 readme = "README.md"
-packages = [{include = "yandex_reviews"}, {include = "google_reviews"}, {include = "prodoctorov_reviews"}, {include = "twogis_reviews"}]
+packages = [{include = "yandex_reviews"}, {include = "google_reviews"}, {include = "prodoctorov_reviews"}, {include = "twogis_reviews"}, {include = "napopravku_reviews"}]
 
 [tool.poetry.dependencies]
 python = "^3.11"
@@ -19,6 +19,7 @@ yandex-reviews = "yandex_reviews.cli:main"
 google-reviews = "google_reviews.cli:main"
 prodoctorov-reviews = "prodoctorov_reviews.cli:main"
 twogis-reviews = "twogis_reviews.cli:main"
+napopravku-reviews = "napopravku_reviews.cli:main"
 
 [build-system]
 requires = ["poetry-core"]

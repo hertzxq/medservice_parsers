@@ -1,1 +1,0 @@
-"api_url = api_url_template\n                # Заменяем или добавляем offset\n                if 'offset=' in api_url:\n                    api_url = re.sub(r'offset=\\d+', f'offset={offset}', api_url)\n                else:\n                    api_url += f'&offset={offset}'\n                # Заменяем или"
