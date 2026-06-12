@@ -13,6 +13,7 @@ beautifulsoup4 = "^4.12"
 lxml = "^5.3"
 pydantic = "^2.10"
 asyncpg = "^0.30"
+httpx = "^0.28"  # прямой публичный reviews-API 2GIS (twogis_reviews/_fetch_via_api)
 
 [tool.poetry.scripts]
 yandex-reviews = "yandex_reviews.cli:main"

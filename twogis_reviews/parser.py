@@ -1,3 +1,4 @@
+import os
 import re
 import json
 import logging
@@ -41,6 +42,11 @@ class TwoGisParser:
 
     def __init__(self, headless: bool = True, **kwargs: Any):
         self.headless = headless
+        # Реальный Chrome (channel="chrome") + headful не триггерит анти-бот
+        # капчу 2GIS ("подозрительная активность"), которая появляется на
+        # bundled-chromium/headless. Задаётся kwarg channel= или env
+        # TWOGIS_PARSER_CHANNEL=chrome.
+        self.channel = kwargs.get("channel") or os.environ.get("TWOGIS_PARSER_CHANNEL") or None
         self.scroll_pause_sec = kwargs.get("scroll_pause_sec", SCROLL_PAUSE_SEC)
         self.scroll_step_px = kwargs.get("scroll_step_px", SCROLL_STEP_PX)
         self.page_load_timeout_sec = kwargs.get("page_load_timeout_sec", PAGE_LOAD_TIMEOUT_SEC)
@@ -63,11 +69,29 @@ class TwoGisParser:
 
         logger.info("Запуск парсинга: %s", url)
 
+        # Сначала — прямой публичный API 2GIS (надёжнее браузера: нет капчи,
+        # нет интерстициала "обновите браузер", даты сразу в ISO). Браузерный
+        # путь остаётся фоллбэком, если API недоступен/сменился ключ.
+        m = re.search(r"/firm/(\d+)", url)
+        if m:
+            try:
+                api_result = await self._fetch_via_api(m.group(1), url)
+            except Exception as exc:
+                logger.warning("2GIS API упал, фоллбэк на браузер: %s", exc)
+                api_result = None
+            if api_result and api_result.reviews:
+                logger.info("2GIS API: получено %d отзывов", api_result.total_parsed)
+                return api_result
+            logger.info("2GIS API не дал отзывов — фоллбэк на браузер")
+
         async with async_playwright() as pw:
-            browser = await pw.chromium.launch(
-                headless=self.headless,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
+            launch_kwargs: dict[str, Any] = {
+                "headless": self.headless,
+                "args": ["--disable-blink-features=AutomationControlled"],
+            }
+            if self.channel:
+                launch_kwargs["channel"] = self.channel
+            browser = await pw.chromium.launch(**launch_kwargs)
             context = await browser.new_context(
                 viewport={"width": 1920, "height": 1080},
                 locale="ru-RU",
@@ -85,6 +109,92 @@ class TwoGisParser:
 
         logger.info("Парсинг завершён: %s | %d отзывов", url, result.total_parsed)
         return result
+
+    async def _fetch_via_api(self, firm_id: str, source_url: str) -> ParseResult | None:
+        """Прямой публичный reviews-API 2GIS (тот, что дёргает виджет отзывов).
+
+        Endpoint: GET /3.0/branches/{firm_id}/reviews — пагинация по offset.
+        Возвращает None, если API недоступен или вернул 0 отзывов (тогда
+        вызывающий код уходит в браузерный фоллбэк).
+        """
+        import httpx
+
+        base = f"https://public-api.reviews.2gis.com/3.0/branches/{firm_id}/reviews"
+        headers = {
+            "Origin": "https://2gis.ru",
+            "Referer": "https://2gis.ru/",
+            "User-Agent": USER_AGENT,
+        }
+        limit = 50
+        offset = 0
+        overall_rating: float | None = None
+        total: int | None = None
+        reviews: list[Review] = []
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            while True:
+                params = {
+                    "limit": limit,
+                    "offset": offset,
+                    "sort_by": "date_created",
+                    "key": DEFAULT_API_KEY,
+                    "locale": "ru_RU",
+                    "fields": "meta.branch_rating,meta.branch_reviews_count,meta.total_count",
+                }
+                resp = await client.get(base, params=params, headers=headers)
+                if resp.status_code != 200:
+                    logger.warning("2GIS API статус %s на offset=%d", resp.status_code, offset)
+                    break
+                data = resp.json()
+                meta = data.get("meta", {}) or {}
+                if overall_rating is None:
+                    overall_rating = meta.get("branch_rating")
+                if total is None:
+                    total = meta.get("total_count") or meta.get("branch_reviews_count")
+
+                batch = data.get("reviews", []) or []
+                if not batch:
+                    break
+
+                for r in batch:
+                    if r.get("is_hidden"):
+                        continue
+                    user = r.get("user") or {}
+                    oa = r.get("official_answer") or {}
+                    response_text = oa.get("text") if isinstance(oa, dict) else None
+                    try:
+                        rating = max(1, min(5, int(round(float(r.get("rating") or 5)))))
+                    except (TypeError, ValueError):
+                        rating = 5
+                    reviews.append(Review(
+                        author=(user.get("name") or "").strip(),
+                        rating=rating,
+                        date=(r.get("date_created") or "")[:10],  # ISO YYYY-MM-DD
+                        text=(r.get("text") or "").strip(),
+                        response=response_text,
+                    ))
+
+                offset += limit
+                if self.max_reviews and len(reviews) >= self.max_reviews:
+                    break
+                if total and offset >= total:
+                    break
+                await asyncio.sleep(0.2)  # вежливый темп
+
+        if not reviews:
+            return None
+
+        return ParseResult(
+            business_info=BusinessInfo(
+                name="",
+                address="",
+                overall_rating=overall_rating,
+                total_reviews_on_page=total,
+            ),
+            reviews=reviews,
+            total_parsed=len(reviews),
+            source_url=source_url,
+        )
 
     async def parse_by_firm_id(self, firm_id: str, city: str = "moscow") -> ParseResult:
         """Парсинг по ID организации и городу."""
@@ -195,8 +305,37 @@ class TwoGisParser:
                 source_url=url,
             )
 
+        # 2GIS иногда показывает интерстициал «2ГИС советует обновить браузер»
+        # вместо контента. Жмём «Пропустить обновление браузера и перейти в 2ГИС»,
+        # иначе отзывы не подгружаются.
+        try:
+            skipped = await page.evaluate(r"""() => {
+                const els = [...document.querySelectorAll('a, button, span, div')];
+                for (const el of els) {
+                    const t = (el.textContent || '').trim().toLowerCase();
+                    if (t.includes('перейти в 2гис') || t.includes('пропустить обновление')) {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""")
+            if skipped:
+                logger.info("Пропущен интерстициал «2ГИС советует обновить браузер»")
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(1500)
+                # Клик уводит со страницы отзывов; cookie «пропустить» уже стоит —
+                # повторно открываем reviews-URL, чтобы сработал перехват API отзывов.
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                await page.wait_for_timeout(2000)
+        except Exception as exc:
+            logger.debug("Интерстициал обновления браузера не обработан: %s", exc)
+
         # Проверяем наличие индикатора «организация не найдена» в DOM
-        not_found = await page.evaluate("""() => {
+        not_found = await page.evaluate(r"""() => {
             const text = document.body?.innerText || '';
             return /не найден|не существует|page not found/i.test(text)
                 && text.length < 2000;
@@ -322,7 +461,7 @@ class TwoGisParser:
             logger.warning("Скролл-контейнер не найден, скроллим документ")
             while stable_count < self.stable_scroll_threshold:
                 current_scroll = await page.evaluate(
-                    """(step) => {
+                    r"""(step) => {
                         window.scrollBy({ top: step, behavior: 'smooth' });
                         return window.scrollY;
                     }""",
@@ -340,7 +479,7 @@ class TwoGisParser:
         scroll_iteration = 0
         while stable_count < self.stable_scroll_threshold:
             current_scroll = await page.evaluate(
-                """([selector, step]) => {
+                r"""([selector, step]) => {
                     const el = document.querySelector(selector);
                     if (!el) return 0;
                     el.scrollBy({ top: step, behavior: 'smooth' });
@@ -366,7 +505,7 @@ class TwoGisParser:
         """Раскрывает обрезанный текст отзывов (кнопка 'Читать целиком')."""
         try:
             # Используем evaluate для поиска и клика — не зависаем
-            expanded = await page.evaluate("""() => {
+            expanded = await page.evaluate(r"""() => {
                 let count = 0;
                 const elements = document.querySelectorAll('span, a, button, div');
                 for (const el of elements) {
@@ -444,7 +583,7 @@ class TwoGisParser:
             for attempt in range(1, self.max_api_retries + 1):
                 try:
                     data = await page.evaluate(
-                        """async (apiUrl) => {
+                        r"""async (apiUrl) => {
                             try {
                                 const resp = await fetch(apiUrl);
                                 if (resp.status === 429) return {__rate_limited: true};
@@ -753,7 +892,7 @@ class TwoGisParser:
 
             # Рейтинг — число рядом со звёздами
             try:
-                rating_text = await page.evaluate("""() => {
+                rating_text = await page.evaluate(r"""() => {
                     // Ищем элемент с рейтингом (обычно число от 1.0 до 5.0)
                     const elements = document.querySelectorAll('span, div');
                     for (const el of elements) {
@@ -775,7 +914,7 @@ class TwoGisParser:
 
             # Количество отзывов — ищем "N отзывов" или "N оценок"
             try:
-                count_text = await page.evaluate("""() => {
+                count_text = await page.evaluate(r"""() => {
                     const elements = document.querySelectorAll('span, div, a');
                     for (const el of elements) {
                         const text = el.textContent.trim();
@@ -808,7 +947,7 @@ class TwoGisParser:
         расположены автор, дата и текст отзыва.
         """
         try:
-            raw_reviews = await page.evaluate("""() => {
+            raw_reviews = await page.evaluate(r"""() => {
                 const reviews = [];
                 const MONTHS_RE = 'января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря';
                 const DATE_RE = new RegExp('(\\d{1,2}\\s+(?:' + MONTHS_RE + ')\\s*\\d{0,4})', 'i');
