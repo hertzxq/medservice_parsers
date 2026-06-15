@@ -91,6 +91,7 @@ class NapopravkuParser:
         soup = BeautifulSoup(html, "lxml")
 
         business_info = self._extract_business_info(soup)
+        self._reviews_page_url = url  # для прямых ссылок на отзыв (#response{id})
         reviews = self._extract_reviews(soup)
 
         return ParseResult(
@@ -330,6 +331,13 @@ class NapopravkuParser:
             if not text:
                 text = self._collect_text(el)
 
+            # Прямая ссылка на отзыв: карточка имеет id="response{n}" → #response{n}.
+            review_url = None
+            el_id = el.get("id")
+            base = getattr(self, "_reviews_page_url", "")
+            if el_id and base:
+                review_url = f"{base.split('#')[0]}#{el_id}"
+
             return Review(
                 author=author,
                 rating=rating,
@@ -339,6 +347,7 @@ class NapopravkuParser:
                 pros=pros,
                 cons=cons,
                 response=response,
+                url=review_url,
             )
         except Exception as exc:
             logger.warning("Ошибка парсинга отзыва (Schema): %s", exc)

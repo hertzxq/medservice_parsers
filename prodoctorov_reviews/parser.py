@@ -79,12 +79,16 @@ class ProdoctorovParser:
         # Определяем базовый URL для пагинации
         page_base = self._get_page_base_url(base_url)
 
+        # URL текущей страницы — нужен для прямых ссылок на отзыв (#rate-{id}).
+        current_url = base_url
+
         while current_page <= self.max_pages:
             logger.info("Обработка страницы %d ...", current_page)
 
             html = await page.content()
             soup = BeautifulSoup(html, "lxml")
 
+            self._reviews_page_url = current_url
             page_reviews = self._extract_reviews(soup)
             if not page_reviews:
                 logger.info("Страница %d: отзывов не найдено, завершаем", current_page)
@@ -111,6 +115,7 @@ class ProdoctorovParser:
 
             await page.goto(next_url, wait_until="domcontentloaded", timeout=timeout_ms)
             await page.wait_for_timeout(self.page_navigate_delay_ms)
+            current_url = next_url
 
         return ParseResult(
             business_info=business_info,
@@ -293,6 +298,14 @@ class ProdoctorovParser:
             # Ответ клиники
             response = self._extract_response(el)
 
+            # Прямая ссылка на отзыв: у карточки есть data-review-id, а внутри —
+            # именованный якорь <a name="rate-{id}">, на который ведёт #rate-{id}.
+            review_url = None
+            rid = el.get("data-review-id")
+            base = getattr(self, "_reviews_page_url", "")
+            if rid and base:
+                review_url = f"{base.split('#')[0]}#rate-{rid}"
+
             return Review(
                 author=author,
                 rating=rating,
@@ -301,6 +314,7 @@ class ProdoctorovParser:
                 pros=pros,
                 cons=cons,
                 response=response,
+                url=review_url,
             )
         except Exception as exc:
             logger.warning("Ошибка парсинга отзыва (Schema): %s", exc)

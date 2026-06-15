@@ -11,6 +11,8 @@ class Review(BaseModel):
     pros: str | None = Field(default=None)
     cons: str | None = Field(default=None)
     response: str | None = Field(default=None)
+    # Прямая ссылка на отзыв: {страница отзывов}#rate-{data-review-id}
+    url: str | None = Field(default=None)
 
 
 class BusinessInfo(BaseModel):
