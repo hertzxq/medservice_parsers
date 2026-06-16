@@ -9,6 +9,8 @@ class Review(BaseModel):
     date: str = Field(default="")
     text: str = Field(default="")
     response: str | None = Field(default=None)
+    # Прямая ссылка на отзыв: ?reviews[publicId]={author.publicId} (см. parser).
+    url: str | None = Field(default=None)
 
 
 class BusinessInfo(BaseModel):

@@ -1,4 +1,6 @@
 import re
+import json
+import asyncio
 import logging
 from typing import Any
 
@@ -63,6 +65,18 @@ class YandexReviewsParser:
 
     async def _parse_page(self, page: Page, url: str) -> ParseResult:
         timeout_ms = self.page_load_timeout_sec * 1000
+
+        # Прямую ссылку на отзыв строим из author.publicId. Его НЕТ в DOM-карточке,
+        # но он есть в данных: первая страница — в SSR-скрипте, остальные —
+        # в ответах XHR /maps/api/business/fetchReviews. Перехватываем ответы.
+        self._org_id = self._extract_org_id(url)
+        self._pid_map: dict[str, str] = {}
+        self._pending: list[asyncio.Future] = []
+
+        # Яндекс грузит страницы 2+ из веб-воркера, поэтому перехват fetch на
+        # главном потоке их не видит — ловим на сетевом уровне Playwright.
+        page.on("response", self._on_response)
+
         await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
 
         try:
@@ -77,11 +91,43 @@ class YandexReviewsParser:
         await self._expand_elements(page, SELECTORS["review_comment_expand"])
         await page.wait_for_timeout(self.post_expand_delay_ms)
 
+        # Хвост: Яндекс догружает отзывы и ПОСЛЕ «стабильного» скролла, поэтому
+        # подскролливаем и ждём, пока перестанут приходить ответы fetchReviews
+        # (иначе ~последняя пачка publicId не успевает перехватиться).
+        scroll_selector = SELECTORS["scroll_container"]
+        for _ in range(12):
+            before = len(self._pending)
+            try:
+                await page.evaluate(
+                    f"() => {{ const el=document.querySelector('{scroll_selector}'); if(el) el.scrollTo(0, el.scrollHeight); }}"
+                )
+            except Exception:
+                pass
+            await page.wait_for_timeout(1500)
+            if self._pending:
+                await asyncio.gather(*self._pending, return_exceptions=True)
+            if len(self._pending) == before:
+                break
+
+        # Снимаем слушатель, чтобы поздние ответы не плодили «осиротевшие» задачи
+        # (Target closed после закрытия браузера), затем дожидаемся собранных.
+        try:
+            page.remove_listener("response", self._on_response)
+        except Exception:
+            pass
+        if self._pending:
+            await asyncio.gather(*self._pending, return_exceptions=True)
+
         html = await page.content()
         soup = BeautifulSoup(html, "lxml")
 
+        # Первая страница отзывов — в SSR-скрипте (чистый JSON).
+        self._index_ssr(soup)
+
         business_info = self._extract_business_info(soup)
         reviews = self._extract_reviews(soup)
+
+        logger.debug("publicId собрано для %d отзывов", len(self._pid_map))
 
         return ParseResult(
             business_info=business_info,
@@ -89,6 +135,79 @@ class YandexReviewsParser:
             total_parsed=len(reviews),
             source_url=url,
         )
+
+    # ── Сбор author.publicId для прямых ссылок на отзыв ──────────────────────
+
+    @staticmethod
+    def _extract_org_id(url: str) -> str:
+        m = re.search(r"/org/(?:[\w-]+/)?(\d+)", url)
+        return m.group(1) if m else ""
+
+    @staticmethod
+    def _review_key(author: str, text: str) -> str:
+        # Ключ устойчив к различиям пробелов/пунктуации между DOM get_text() и
+        # JSON-текстом: оставляем только буквы/цифры (кириллица в т.ч.), ё→е.
+        norm = lambda s: re.sub(r"[^0-9a-zа-я]+", "", (s or "").lower().replace("ё", "е"))
+        t = norm(text)
+        if len(t) >= 8:
+            return t[:120]
+        # Короткий/пустой текст — добавляем автора, чтобы снизить коллизии.
+        return f"{norm(author)}|{t}"
+
+    def _on_response(self, response) -> None:
+        if "fetchReviews" in (getattr(response, "url", "") or ""):
+            self._pending.append(asyncio.ensure_future(self._consume_response(response)))
+
+    async def _consume_response(self, response) -> None:
+        try:
+            text = await response.text()
+            self._index_reviews_json(json.loads(text))
+        except Exception:
+            return
+
+    def _index_ssr(self, soup: BeautifulSoup) -> None:
+        for sc in soup.find_all("script"):
+            txt = sc.string or sc.get_text() or ""
+            if '"reviews"' in txt and "publicId" in txt:
+                try:
+                    data = json.loads(txt)
+                except Exception:
+                    continue
+                self._index_reviews_json(data)
+                break
+
+    def _index_reviews_json(self, data: Any) -> None:
+        arr = self._find_reviews_array(data)
+        if not arr:
+            return
+        for r in arr:
+            try:
+                author = r.get("author") or {}
+                pid = author.get("publicId")
+                if pid:
+                    self._pid_map[self._review_key(author.get("name", ""), r.get("text", ""))] = pid
+            except Exception:
+                continue
+
+    def _find_reviews_array(self, o: Any, depth: int = 0):
+        if o is None or depth > 8:
+            return None
+        if isinstance(o, dict):
+            rv = o.get("reviews")
+            if isinstance(rv, list) and rv and isinstance(rv[0], dict) and "author" in rv[0] and "text" in rv[0]:
+                return rv
+            for v in o.values():
+                r = self._find_reviews_array(v, depth + 1)
+                if r:
+                    return r
+        elif isinstance(o, list):
+            if o and isinstance(o[0], dict) and "author" in o[0] and "text" in o[0]:
+                return o
+            for it in o:
+                r = self._find_reviews_array(it, depth + 1)
+                if r:
+                    return r
+        return None
 
     async def _scroll_to_bottom(self, page: Page) -> None:
         last_scroll = -1
@@ -180,12 +299,22 @@ class YandexReviewsParser:
             if response_el:
                 response = response_el.get_text(strip=True)
 
+            # Прямая ссылка на отзыв по author.publicId, собранному из SSR/XHR.
+            review_url = None
+            pid = self._pid_map.get(self._review_key(author, text))
+            if pid and self._org_id:
+                review_url = (
+                    f"https://yandex.ru/maps/org/{self._org_id}"
+                    f"/reviews?reviews[publicId]={pid}"
+                )
+
             return Review(
                 author=author,
                 rating=rating,
                 date=date,
                 text=text,
                 response=response,
+                url=review_url,
             )
         except Exception as exc:
             logger.warning("Ошибка парсинга отзыва: %s", exc)
